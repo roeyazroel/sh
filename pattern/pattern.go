@@ -259,23 +259,20 @@ func regexpNext(sb *strings.Builder, sl *stringLexer, mode Mode) error {
 		}
 		sb.WriteString(regexp.QuoteMeta(string(c)))
 	case '[':
-		// TODO: surely char classes can be mixed with others, e.g. [[:foo:]xyz]
-		if name, err := charClass(sl.peekRest()); err != nil {
-			return &SyntaxError{msg: "charClass invalid", err: err}
-		} else if name != "" {
-			sb.WriteByte('[')
-			sb.WriteString(name)
-			sl.i += len(name)
-			break
-		}
 		if mode&Filenames != 0 {
-			for i, c := range sl.peekRest() {
-				if i > 0 && c == ']' {
-					break
-				} else if c == '/' {
-					sb.WriteString(`\[`)
-					return nil
-				}
+			rest := sl.peekRest()
+			end, closed, hasSlash, err := bracketEnd(rest)
+			if err != nil {
+				return &SyntaxError{msg: "charClass invalid", err: err}
+			}
+			if hasSlash && closed {
+				sb.WriteString(regexp.QuoteMeta("[" + rest[:end]))
+				sl.i += end
+				return nil
+			}
+			if hasSlash {
+				sb.WriteString(`\[`)
+				return nil
 			}
 		}
 		sb.WriteRune(c)
@@ -311,6 +308,15 @@ func regexpNext(sb *strings.Builder, sl *stringLexer, mode Mode) error {
 				if end != ']' && start > end {
 					return &SyntaxError{msg: fmt.Sprintf("invalid range: %c-%c", start, end)}
 				}
+			case '[':
+				classLen, err := charClass(sl.peekRest())
+				if err != nil {
+					return &SyntaxError{msg: "charClass invalid", err: err}
+				}
+				if classLen > 0 {
+					sb.WriteString(sl.peekRest()[:classLen])
+					sl.i += classLen
+				}
 			case ']':
 				return nil
 			}
@@ -326,25 +332,121 @@ func regexpNext(sb *strings.Builder, sl *stringLexer, mode Mode) error {
 	return nil
 }
 
-func charClass(s string) (string, error) {
-	if strings.HasPrefix(s, "[.") || strings.HasPrefix(s, "[=") {
-		return "", fmt.Errorf("collating features not available")
+func charClass(s string) (int, error) {
+	if strings.HasPrefix(s, ".") || strings.HasPrefix(s, "=") {
+		return 0, fmt.Errorf("collating features not available")
 	}
-	name, ok := strings.CutPrefix(s, "[:")
+	name, ok := strings.CutPrefix(s, ":")
 	if !ok {
-		return "", nil
+		return 0, nil
 	}
-	name, _, ok = strings.Cut(name, ":]]")
+	name, _, ok = strings.Cut(name, ":]")
 	if !ok {
-		return "", fmt.Errorf("[[: was not matched with a closing :]]")
+		return 0, fmt.Errorf("[[: was not matched with a closing :]")
 	}
 	switch name {
 	case "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph",
 		"lower", "print", "punct", "space", "upper", "word", "xdigit":
 	default:
-		return "", fmt.Errorf("invalid character class: %q", name)
+		return 0, fmt.Errorf("invalid character class: %q", name)
 	}
-	return s[:len(name)+5], nil
+	return len(name) + 3, nil
+}
+
+// posixClassLen returns the length of a complete POSIX character class after
+// its opening bracket. It does not validate the class name.
+func posixClassLen(s string) int {
+	name, ok := strings.CutPrefix(s, ":")
+	if !ok {
+		return 0
+	}
+	name, _, ok = strings.Cut(name, ":]")
+	if !ok {
+		return 0
+	}
+	return len(name) + 3
+}
+
+// bracketElementLen returns the length of a complete bracket element after its
+// opening bracket. It does not validate the element.
+func bracketElementLen(s string) int {
+	if classLen := posixClassLen(s); classLen > 0 {
+		return classLen
+	}
+	if len(s) == 0 || (s[0] != '.' && s[0] != '=') {
+		return 0
+	}
+	name, _, ok := strings.Cut(s[1:], string(s[0])+"]")
+	if !ok {
+		return 0
+	}
+	return len(name) + 3
+}
+
+// bracketEnd returns the byte index after the closing bracket expression in s,
+// which starts immediately after its opening bracket. It follows the same
+// bracket-expression rules as regexpNext while scanning for a slash.
+func bracketEnd(s string) (end int, closed, hasSlash bool, err error) {
+	end = len(s)
+	i := 0
+	var classErr error
+	if i < len(s) {
+		c, size := utf8.DecodeRuneInString(s[i:])
+		if c == '!' || c == '^' {
+			i += size
+		}
+	}
+	if i < len(s) {
+		c, size := utf8.DecodeRuneInString(s[i:])
+		if c == ']' {
+			i += size
+		}
+	}
+	for i < len(s) {
+		tail := s[i:]
+		c, size := utf8.DecodeRuneInString(tail)
+		if c == '\\' {
+			i += size
+			if i == len(s) {
+				break
+			}
+			c, size = utf8.DecodeRuneInString(s[i:])
+			if c == '/' {
+				hasSlash = true
+			}
+			i += size
+			continue
+		}
+		if c == '[' {
+			classLen, err := charClass(tail[1:])
+			if err != nil {
+				if classErr == nil {
+					classErr = err
+				}
+				classLen = bracketElementLen(tail[1:])
+			}
+			if classLen > 0 {
+				if strings.Contains(tail[:1+classLen], "/") {
+					hasSlash = true
+				}
+				i += 1 + classLen
+				continue
+			}
+		}
+		if c == '/' {
+			hasSlash = true
+		} else if c == ']' {
+			if hasSlash {
+				return i + size, true, true, nil
+			}
+			return i + size, true, false, classErr
+		}
+		i += size
+	}
+	if hasSlash {
+		return end, false, true, nil
+	}
+	return end, false, false, classErr
 }
 
 // HasMeta returns whether a string contains any unescaped pattern
